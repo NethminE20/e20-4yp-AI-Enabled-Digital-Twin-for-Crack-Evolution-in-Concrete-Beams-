@@ -1,9 +1,14 @@
 using UnityEngine;
 using Unity.Barracuda;
+using TMPro;
 
-// 1. DATA STRUCTURES
+#region Scaler Data Structures
 [System.Serializable]
-public class ScalerItem { public float mean; public float scale; }
+public class ScalerItem
+{
+    public float mean;
+    public float scale;
+}
 
 [System.Serializable]
 public class ScalerData
@@ -15,163 +20,204 @@ public class ScalerData
     public ScalerItem fc;
     public ScalerItem fy;
 }
+#endregion
 
+[RequireComponent(typeof(MeshFilter))]
 public class DigitalTwinVisualizer : MonoBehaviour
 {
+    // ============================
+    // AI
+    // ============================
     [Header("AI Brain")]
     public NNModel modelAsset;
     public TextAsset scalerJson;
 
+    // ============================
+    // Live Inputs
+    // ============================
     [Header("Live Inputs")]
-    [Range(0, 180000)] public float loadVal = 50000f;
-    public float deflectionVal = 5.5f;
+    [Range(0, 180000)] public float loadVal = 0f;   // N
+    public float deflectionVal = 5.5f;              // mm
     public float fc = 25f;
-    public float fy = 314f;
+    public float fy = 314f;                          // MPa
 
+    // ============================
+    // Beam Geometry
+    // ============================
     [Header("Beam Physics")]
     public float beamLengthMM = 1050f;
     public float beamHeightMM = 300f;
 
+    // ============================
+    // Mapping
+    // ============================
     [Header("Coordinate Mapping")]
     public bool centerIsZero = true;
 
+    // ============================
+    // Visualization
+    // ============================
     [Header("Visualization")]
     public Gradient colorGradient;
+    [Range(0.1f, 5f)] public float sensitivity = 1f;
 
-    [Range(0.1f, 5.0f)]
-    public float sensitivity = 1.0f;
+    [Header("Validation Display")]
+    public TextMeshPro validationText;
 
-    [Header("Crack Visualization")]
-    [Tooltip("If stress (0.0 to 1.0) goes above this value, show cracks.")]
-    [Range(0.0f, 1.0f)]
-    public float crackThreshold = 0.85f; // New Setting
-
-    [Tooltip("The color of the cracked area (usually Black).")]
-    public Color crackColor = Color.black; // New Setting
-
+    // ============================
     // Internals
+    // ============================
     private IWorker worker;
     private ScalerData scalers;
     private Mesh mesh;
+
+    private Vector3[] originalVertices;
     private Vector3[] vertices;
     private Color[] colors;
 
-    // OPTIMIZATION variables
-    private float prevLoad, prevDefl, prevSens, prevCrackLimit;
-    private bool prevCenterMapping;
-
+    // ============================
+    // Init
+    // ============================
     void Start()
     {
-        // 1. Force Beam Generation (Supports both Generator types)
-        if (TryGetComponent<GridMeshGenerator>(out GridMeshGenerator gridGen))
-            gridGen.GenerateMesh();
+        mesh = GetComponent<MeshFilter>().mesh;
 
-        // 2. Get Mesh
-        if (TryGetComponent<MeshFilter>(out MeshFilter mf))
-        {
-            mesh = mf.mesh;
-            vertices = mesh.vertices;
-            colors = new Color[vertices.Length];
-        }
-        else
-        {
-            Debug.LogError("❌ No MeshFilter found!");
-            return;
-        }
+        originalVertices = mesh.vertices;
+        vertices = new Vector3[originalVertices.Length];
+        colors = new Color[originalVertices.Length];
 
-        // 3. Load Scalers & Model
-        if (scalerJson) scalers = JsonUtility.FromJson<ScalerData>(scalerJson.text);
-        if (modelAsset)
+        if (scalerJson != null)
+            scalers = JsonUtility.FromJson<ScalerData>(scalerJson.text);
+
+        if (modelAsset != null)
         {
             var model = ModelLoader.Load(modelAsset);
             worker = WorkerFactory.CreateWorker(WorkerFactory.Type.Auto, model);
         }
     }
 
+    // ============================
+    // Update
+    // ============================
     void Update()
     {
-        if (worker == null || scalers == null || mesh == null) return;
-
-        // CHECK: Also update if crack settings change
-        bool inputsChanged = !Mathf.Approximately(loadVal, prevLoad) ||
-                             !Mathf.Approximately(deflectionVal, prevDefl) ||
-                             !Mathf.Approximately(sensitivity, prevSens) ||
-                             !Mathf.Approximately(crackThreshold, prevCrackLimit) ||
-                             centerIsZero != prevCenterMapping;
-
-        if (!inputsChanged) return;
-
-        prevLoad = loadVal;
-        prevDefl = deflectionVal;
-        prevSens = sensitivity;
-        prevCrackLimit = crackThreshold;
-        prevCenterMapping = centerIsZero;
+        if (worker == null || scalers == null || mesh == null)
+            return;
 
         RunBatchInference();
     }
 
+    // ============================
+    // Core Logic
+    // ============================
     void RunBatchInference()
     {
-        int vCount = vertices.Length;
-        float[] batchInput = new float[vCount * 6];
+        int vCount = originalVertices.Length;
+        float[] inputData = new float[vCount * 6];
 
+        // ---- Normalize global inputs
         float nLoad = (loadVal - scalers.load_mag.mean) / scalers.load_mag.scale;
         float nDefl = (deflectionVal - scalers.global_deflection.mean) / scalers.global_deflection.scale;
         float nFc = (fc - scalers.fc.mean) / scalers.fc.scale;
         float nFy = (fy - scalers.fy.mean) / scalers.fy.scale;
 
+        // ---- Build NN input
         for (int i = 0; i < vCount; i++)
         {
-            float physX = 0;
-            if (centerIsZero)
-                physX = vertices[i].x * beamLengthMM;
-            else
-                physX = (vertices[i].x + 0.5f) * beamLengthMM;
+            Vector3 v0 = originalVertices[i];
 
-            float physY = vertices[i].y * beamHeightMM;
+            float physX = centerIsZero
+                ? v0.x * beamLengthMM
+                : (v0.x + 0.5f) * beamLengthMM;
+
+            float physY = v0.y * beamHeightMM;
 
             float nX = (physX - scalers.x.mean) / scalers.x.scale;
             float nY = (physY - scalers.y.mean) / scalers.y.scale;
 
-            int baseIdx = i * 6;
-            batchInput[baseIdx + 0] = nX;
-            batchInput[baseIdx + 1] = nY;
-            batchInput[baseIdx + 2] = nLoad;
-            batchInput[baseIdx + 3] = nDefl;
-            batchInput[baseIdx + 4] = nFc;
-            batchInput[baseIdx + 5] = nFy;
+            int idx = i * 6;
+            inputData[idx + 0] = nX;
+            inputData[idx + 1] = nY;
+            inputData[idx + 2] = nLoad;
+            inputData[idx + 3] = nDefl;
+            inputData[idx + 4] = nFc;
+            inputData[idx + 5] = nFy;
         }
 
-        using (Tensor inputTensor = new Tensor(vCount, 6, batchInput))
+        using (Tensor inputTensor = new Tensor(vCount, 6, inputData))
         {
             worker.Execute(inputTensor);
             Tensor output = worker.PeekOutput();
 
+            float maxStress = 0f;
+            float halfLengthMM = beamLengthMM * 0.5f;
+            float maxDeflectionM = deflectionVal * 0.001f;
+
+            // ---- PHYSICS: linear load scaling
+            float loadRatio = Mathf.Clamp01(loadVal / 180000f); // max design load
+
             for (int i = 0; i < vCount; i++)
             {
-                float stressNorm = output[i, 1]; // Raw AI output
+                Vector3 v = originalVertices[i];
 
-                // Calculate visual intensity (0.0 to 1.0)
-                float t = Mathf.Abs(stressNorm) / sensitivity;
+                // ============================
+                // STRESS (SHAPE × LOAD × fy)
+                // ============================
+                float stressMPa = 0f;
 
-                // --- NEW CRACK LOGIC ---
-                // If the normalized stress is higher than the limit, Paint it BLACK
-                if (t >= crackThreshold)
+                if (loadVal > 0f)
                 {
-                    colors[i] = crackColor;
+                    float shape = Mathf.Abs(output[i, 1]); // NN gives shape only
+                    stressMPa = shape * fy * loadRatio;
+
+                    maxStress = Mathf.Max(maxStress, stressMPa);
                 }
-                else
+
+                float t = (loadVal > 0f)
+                    ? Mathf.Clamp01(stressMPa / fy)
+                    : 0f;
+
+                colors[i] = colorGradient.Evaluate(t);
+
+                // ============================
+                // DEFORMATION (visual)
+                // ============================
+                if (loadVal > 0f)
                 {
-                    // Otherwise, use the normal heatmap gradient
-                    colors[i] = colorGradient.Evaluate(Mathf.Clamp01(t));
+                    float physX = centerIsZero
+                        ? v.x * beamLengthMM
+                        : (v.x + 0.5f) * beamLengthMM;
+
+                    float xi = 1f - Mathf.Abs(physX) / halfLengthMM;
+                    xi = Mathf.Clamp01(xi);
+
+                    float deflection = -xi * xi * maxDeflectionM * sensitivity;
+                    v.y += deflection;
                 }
+
+                vertices[i] = v;
             }
-            output.Dispose();
-        }
 
-        mesh.colors = colors;
+            output.Dispose();
+
+            // ---- Apply mesh updates
+            mesh.vertices = vertices;
+            mesh.colors = colors;
+            mesh.RecalculateNormals();
+
+            // ---- UI
+            if (validationText != null)
+            {
+                validationText.text =
+                    $"Load = {loadVal:F0} N\n" +
+                    $"σmax = {maxStress:F3} MPa";
+            }
+        }
     }
 
+    // ============================
+    // Cleanup
+    // ============================
     void OnDestroy()
     {
         worker?.Dispose();
